@@ -11,6 +11,10 @@ resource "aws_ssm_parameter" "spacelift_api_key_secret" {
 
 resource "terraform_data" "download" {
   count = var.enable_autoscaling ? 1 : 0
+  triggers_replace = {
+    # Always re-download the archive file
+    now = timestamp()
+  }
   provisioner "local-exec" {
     command = "${path.module}/download.sh ${var.autoscaler_version}"
   }
