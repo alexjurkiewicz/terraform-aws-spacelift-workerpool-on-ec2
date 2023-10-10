@@ -1,5 +1,5 @@
 locals {
-  function_name = "ec2-autoscaler-${var.worker_pool_id}"
+  function_name = "${local.base_name}-ec2-autoscaler"
 }
 
 resource "aws_ssm_parameter" "spacelift_api_key_secret" {
