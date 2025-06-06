@@ -1,19 +1,31 @@
+"""
+This script handles EC2_INSTANCE_TERMINATING messages from an auto scaling group
+(delivered by SQS). It drains any worker associated with the instance in a
+given Spacelift worker pool.
+"""
+
 import json
 import urllib.request
 import boto3
 import os
+from typing import Any
 
-sqs = boto3.client('sqs')
-autoscaling = boto3.client('autoscaling')
-ssm = boto3.client('ssm')
-api_key = ssm.get_parameter(Name=os.environ.get("SPACELIFT_API_KEY_SECRET_NAME"), WithDecryption=True)['Parameter']['Value']
+sqs = boto3.client("sqs")
+autoscaling = boto3.client("autoscaling")
+ssm = boto3.client("ssm")
+API_KEY_SECRET = ssm.get_parameter(
+    Name=os.environ.get("SPACELIFT_API_KEY_SECRET_NAME"), WithDecryption=True
+)["Parameter"]["Value"]
 
-domain = os.environ.get("SPACELIFT_API_KEY_ENDPOINT", None)
-api_key_id = os.environ.get("SPACELIFT_API_KEY_ID", None)
-worker_pool_id = os.environ.get("SPACELIFT_WORKER_POOL_ID", None)
-queue_url = os.environ.get("QUEUE_URL", None)
+ENDPOINT = os.environ["SPACELIFT_API_KEY_ENDPOINT"]
+API_KEY_ID = os.environ["SPACELIFT_API_KEY_ID"]
+WORKER_POOL_ID = os.environ["SPACELIFT_WORKER_POOL_ID"]
+QUEUE_URL = os.environ["QUEUE_URL"]
 
-def query_api(query: str, variables: dict = None, token: str = None) -> dict:
+
+def query_api(
+    query: str, variables: dict[str, str] | None = None, token: str | None = None
+) -> dict:
     headers = {
         "Content-Type": "application/json",
     }
@@ -21,16 +33,18 @@ def query_api(query: str, variables: dict = None, token: str = None) -> dict:
     if token is not None:
         headers["Authorization"] = f"Bearer {token}"
 
-    data = {
+    data: dict[str, str | dict[str, str]] = {
         "query": query,
     }
 
     if variables is not None:
         data["variables"] = variables
 
-    req = urllib.request.Request(f"{domain}/graphql", json.dumps(data).encode('utf-8'), headers)
+    req = urllib.request.Request(
+        f"{ENDPOINT}/graphql", json.dumps(data).encode("utf-8"), headers
+    )
     with urllib.request.urlopen(req) as response:
-        resp = json.loads(response.read().decode('utf-8'))
+        resp = json.loads(response.read().decode("utf-8"))
 
     if "errors" in resp:
         print(f"Error: {resp['errors']}")
@@ -38,7 +52,8 @@ def query_api(query: str, variables: dict = None, token: str = None) -> dict:
     else:
         return resp
 
-def get_token():
+
+def get_token() -> str:
     token_mutation = """
         mutation GetSpaceliftToken($id: ID!, $secret: String!) {
             apiKeyUser(id: $id, secret: $secret) {
@@ -47,15 +62,12 @@ def get_token():
         }
     """
 
-    token_variables = {
-        "id": api_key_id,
-        "secret": api_key
-    }
+    token_variables = {"id": API_KEY_ID, "secret": API_KEY_SECRET}
 
     token_response = query_api(token_mutation, token_variables)
     return token_response["data"]["apiKeyUser"]["jwt"]
 
-def get_workerpool(token):
+def get_instance_id_to_worker_pool_id(token: str) -> dict[str, str]:
     workerpool_query = """
         query GetWorkerpool($id: ID!) {
             workerPool(id: $id) {
@@ -66,9 +78,7 @@ def get_workerpool(token):
             }
         }
     """
-    workerpool_variables = {
-        "id": worker_pool_id
-    }
+    workerpool_variables = {"id": WORKER_POOL_ID}
     workerpool_response = query_api(workerpool_query, workerpool_variables, token)
     workers = workerpool_response["data"]["workerPool"]["workers"]
 
@@ -81,7 +91,8 @@ def get_workerpool(token):
 
     return instance_id_to_worker
 
-def drain_worker(worker, token):
+
+def drain_worker(worker: str, token: str) -> bool:
     print(f"Draining worker {worker}")
     drain_mutation = """
         mutation DrainWorker($workerPool: ID!, $id: ID!, $drain: Boolean!) {
@@ -90,11 +101,7 @@ def drain_worker(worker, token):
             }
         }
     """
-    drain_variables = {
-        "id": worker,
-        "workerPool": worker_pool_id,
-        "drain": True
-    }
+    drain_variables = {"id": worker, "workerPool": WORKER_POOL_ID, "drain": True}
     drain_response = query_api(drain_mutation, drain_variables, token)
     if "errors" in drain_response:
         print(f"Drain Error: {drain_response['errors']}")
@@ -107,13 +114,19 @@ def drain_worker(worker, token):
         print("Drain Success!")
         return True
 
-def complete_hook(lifecycle_hook_name, autoscaling_group_name, lifecycle_action_token, instance_id):
+
+def complete_hook(
+    lifecycle_hook_name: str,
+    autoscaling_group_name: str,
+    lifecycle_action_token: str,
+    instance_id: str,
+):
     status = autoscaling.complete_lifecycle_action(
         LifecycleHookName=lifecycle_hook_name,
         AutoScalingGroupName=autoscaling_group_name,
         LifecycleActionToken=lifecycle_action_token,
         LifecycleActionResult="CONTINUE",
-        InstanceId=instance_id
+        InstanceId=instance_id,
     )
     if "ResponseMetadata" in status and "HTTPStatusCode" in status["ResponseMetadata"]:
         if status["ResponseMetadata"]["HTTPStatusCode"] == 200:
@@ -125,7 +138,7 @@ def complete_hook(lifecycle_hook_name, autoscaling_group_name, lifecycle_action_
     return False
 
 
-def put_message_back_on_queue(event):
+def put_message_back_on_queue(event: dict[str, Any]) -> None:
     delay_seconds = 2
     retry = 1
     if "retry" in event:
@@ -135,10 +148,7 @@ def put_message_back_on_queue(event):
     if delay_seconds >= 15 * 60:
         delay_seconds = 15 * 60
 
-    event["retry"] = {
-        "delay_seconds": delay_seconds,
-        "retry": retry
-    }
+    event["retry"] = {"delay_seconds": delay_seconds, "retry": retry}
 
     if event["retry"]["retry"] >= 30:
         # We should hit this after about 45 minutes of retrying
@@ -148,16 +158,15 @@ def put_message_back_on_queue(event):
 
     print(f"Retrying event in {delay_seconds} seconds.")
     sqs.send_message(
-        QueueUrl=queue_url,
-        MessageBody=json.dumps(event),
-        DelaySeconds=delay_seconds
+        QueueUrl=QUEUE_URL, MessageBody=json.dumps(event), DelaySeconds=delay_seconds
     )
 
-def main(event, context):
+
+def main(event: dict[str, Any], context: Any) -> None:
     print(event)
 
     token = get_token()
-    workers = get_workerpool(token)
+    worker_ids = get_instance_id_to_worker_pool_id(token)
 
     for record in event["Records"]:
         body = json.loads(record["body"])
@@ -166,23 +175,33 @@ def main(event, context):
             print("Received test notification. Skipping")
             continue
 
-        instance_id = body["EC2InstanceId"] if "EC2InstanceId" in body else None
-        lifecycle_hook_name = body["LifecycleHookName"] if "LifecycleHookName" in body else None
-        autoscaling_group_name = body["AutoScalingGroupName"] if "AutoScalingGroupName" in body else None
-        lifecycle_action_token = body["LifecycleActionToken"] if "LifecycleActionToken" in body else None
+        instance_id = body.get("EC2InstanceId")
+        lifecycle_hook_name = body.get("LifecycleHookName")
+        autoscaling_group_name = body.get("AutoScalingGroupName")
+        lifecycle_action_token = body.get("LifecycleActionToken")
 
-        if instance_id is None or lifecycle_hook_name is None or autoscaling_group_name is None or lifecycle_action_token is None:
+        if (
+            instance_id is None
+            or lifecycle_hook_name is None
+            or autoscaling_group_name is None
+            or lifecycle_action_token is None
+        ):
             print("Missing required fields in the event. Skipping")
             continue
 
-        worker = workers.get(instance_id)
+        worker_id = worker_ids.get(instance_id)
 
-        if worker:
-            success = drain_worker(worker, token)
+        if worker_id:
+            success = drain_worker(worker_id, token)
             if not success:
                 put_message_back_on_queue(body)
             else:
-                success = complete_hook(lifecycle_hook_name, autoscaling_group_name, lifecycle_action_token, instance_id)
+                success = complete_hook(
+                    lifecycle_hook_name,
+                    autoscaling_group_name,
+                    lifecycle_action_token,
+                    instance_id,
+                )
                 if not success:
                     put_message_back_on_queue(body)
         else:
